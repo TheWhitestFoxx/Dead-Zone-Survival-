@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>Dead Zone: Survival</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; overflow: hidden; background: #101614; color: #f3f5f2;
+      font: 16px system-ui, sans-serif; touch-action: none;
+    }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #hud {
+      position: fixed; inset: 12px 12px auto; display: flex;
+      justify-content: space-between; gap: 10px; pointer-events: none;
+      text-shadow: 0 2px 4px #000; font-weight: 700;
+    }
+    #hint {
+      position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%);
+      color: #d5ddd8; background: #101614bb; padding: 8px 12px;
+      border-radius: 8px; text-align: center; font-size: 13px;
+      pointer-events: none; white-space: nowrap;
+    }
+    #controls { position: fixed; inset: auto 18px 55px; display: none; align-items: end; justify-content: space-between; }
+    .pad { display: grid; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(2, 48px); gap: 4px; }
+    button {
+      border: 1px solid #ffffff55; border-radius: 12px; color: white;
+      background: #26352dcc; font-size: 20px; font-weight: bold;
+      touch-action: none; user-select: none;
+    }
+    #fire { width: 76px; height: 76px; border-radius: 50%; background: #8e302dcc; }
+    @media (pointer: coarse) { #controls { display: flex; } #hint { bottom: 150px; } }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="hud"><span id="stats"></span><span>DEAD ZONE</span></div>
+  <div id="hint">WASD / arrows to move · Mouse to aim and fire · R to restart</div>
+  <div id="controls">
+    <div class="pad">
+      <span></span><button data-key="up">▲</button><span></span>
+      <button data-key="left">◀</button><button data-key="down">▼</button><button data-key="right">▶</button>
+    </div>
+    <button id="fire">FIRE</button>
+  </div>
+<script>
+(() => {
+  const canvas = document.querySelector("#game");
+  const ctx = canvas.getContext("2d");
+  const stats = document.querySelector("#stats");
+  let w, h, last = 0, spawnTimer = 0, gameOver = false;
+  const keys = new Set(), bullets = [], zombies = [];
+  const player = { x: 0, y: 0, r: 13, hp: 100, score: 0, speed: 220, cooldown: 0, aim: 0 };
+  const pointer = { x: 0, y: 0, down: false };
+  const held = { up:false, down:false, left:false, right:false, fire:false };
+
+  function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    w = innerWidth; h = innerHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (!player.x) { player.x = w / 2; player.y = h / 2; }
+  }
+  addEventListener("resize", resize); resize();
+
+  addEventListener("keydown", e => {
+    keys.add(e.key.toLowerCase());
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase())) e.preventDefault();
+    if (e.key.toLowerCase() === "r" && gameOver) restart();
+  });
+  addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+  canvas.addEventListener("pointermove", e => { pointer.x=e.clientX; pointer.y=e.clientY; });
+  canvas.addEventListener("pointerdown", e => { pointer.down=true; pointer.x=e.clientX; pointer.y=e.clientY; });
+  addEventListener("pointerup", () => pointer.down=false);
+
+  document.querySelectorAll("[data-key]").forEach(b => {
+    const k=b.dataset.key;
+    const set = v => { held[k]=v; };
+    b.addEventListener("pointerdown", e => { e.preventDefault(); set(true); b.setPointerCapture(e.pointerId); });
+    b.addEventListener("pointerup", () => set(false));
+    b.addEventListener("pointercancel", () => set(false));
+  });
+  const fireButton=document.querySelector("#fire");
+  fireButton.addEventListener("pointerdown", e => { e.preventDefault(); held.fire=true; fireButton.setPointerCapture(e.pointerId); });
+  fireButton.addEventListener("pointerup", () => held.fire=false);
+  fireButton.addEventListener("pointercancel", () => held.fire=false);
+
+  function shoot(angle) {
+    const speed=560;
+    bullets.push({x:player.x+Math.cos(angle)*18,y:player.y+Math.sin(angle)*18,
+      vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,life:1.1});
+  }
+  function spawnZombie() {
+    const side=Math.floor(Math.random()*4);
+    const x=side===0?0:side===1?w:Math.random()*w;
+    const y=side===2?0:side===3?h:Math.random()*h;
+    zombies.push({x,y,r:14,hp:2,speed:35+Math.random()*22});
+  }
+  function restart() {
+    player.x=w/2; player.y=h/2; player.hp=100; player.score=0;
+    bullets.length=0; zombies.length=0; gameOver=false; spawnTimer=0;
+  }
+  function update(dt) {
+    if (gameOver) return;
+    let dx=0,dy=0;
+    if (keys.has("w")||keys.has("arrowup")||held.up) dy--;
+    if (keys.has("s")||keys.has("arrowdown")||held.down) dy++;
+    if (keys.has("a")||keys.has("arrowleft")||held.left) dx--;
+    if (keys.has("d")||keys.has("arrowright")||held.right) dx++;
+    const mag=Math.hypot(dx,dy)||1;
+    player.x=Math.max(player.r,Math.min(w-player.r,player.x+dx/mag*player.speed*dt));
+    player.y=Math.max(player.r,Math.min(h-player.r,player.y+dy/mag*player.speed*dt));
+
+    if (pointer.x || pointer.y) player.aim=Math.atan2(pointer.y-player.y,pointer.x-player.x);
+    player.cooldown-=dt;
+    if ((pointer.down||held.fire) && player.cooldown<=0) {
+      shoot(player.aim); player.cooldown=.2;
+    }
+
+    spawnTimer-=dt;
+    if (spawnTimer<=0) { spawnZombie(); spawnTimer=Math.max(.35,1.25-player.score*.008); }
+
+    for (let i=bullets.length-1;i>=0;i--) {
+      const b=bullets[i]; b.x+=b.vx*dt; b.y+=b.vy*dt; b.life-=dt;
+      if (b.life<=0 || b.x<0 || b.x>w || b.y<0 || b.y>h) bullets.splice(i,1);
+    }
+    for (let i=zombies.length-1;i>=0;i--) {
+      const z=zombies[i], a=Math.atan2(player.y-z.y,player.x-z.x);
+      z.x+=Math.cos(a)*z.speed*dt; z.y+=Math.sin(a)*z.speed*dt;
+      if (Math.hypot(player.x-z.x,player.y-z.y)<player.r+z.r) {
+        player.hp-=24*dt;
+        if (player.hp<=0) { player.hp=0; gameOver=true; }
+      }
+      for (let j=bullets.length-1;j>=0;j--) {
+        const b=bullets[j];
+        if (Math.hypot(b.x-z.x,b.y-z.y)<z.r+4) {
+          z.hp--; bullets.splice(j,1);
+          if (z.hp<=0) { zombies.splice(i,1); player.score++; }
+          break;
+        }
+      }
+    }
+  }
+  function draw() {
+    ctx.fillStyle="#18211d"; ctx.fillRect(0,0,w,h);
+    ctx.strokeStyle="#26332d"; ctx.lineWidth=1;
+    for(let x=0;x<w;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+    for(let y=0;y<h;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+
+    bullets.forEach(b=>{ctx.fillStyle="#ffd36a";ctx.beginPath();ctx.arc(b.x,b.y,4,0,Math.PI*2);ctx.fill();});
+    zombies.forEach(z=>{
+      ctx.fillStyle="#668c57";ctx.beginPath();ctx.arc(z.x,z.y,z.r,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle="#1b241b";ctx.fillRect(z.x-7,z.y-3,4,4);ctx.fillRect(z.x+3,z.y-3,4,4);
+    });
+    ctx.save(); ctx.translate(player.x,player.y); ctx.rotate(player.aim);
+    ctx.fillStyle="#d5ded8";ctx.fillRect(0,-5,22,10);
+    ctx.fillStyle="#56b4a0";ctx.beginPath();ctx.arc(0,0,player.r,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+
+    stats.textContent=`Health: ${Math.ceil(player.hp)}  |  Eliminations: ${player.score}`;
+    if(gameOver){
+      ctx.fillStyle="#000a";ctx.fillRect(0,0,w,h);
+      ctx.textAlign="center";ctx.fillStyle="white";
+      ctx.font="bold 42px system-ui";ctx.fillText("GAME OVER",w/2,h/2-15);
+      ctx.font="18px system-ui";ctx.fillText(`Eliminations: ${player.score} · Press R to restart`,w/2,h/2+25);
+    }
+  }
+  function frame(t) {
+    const dt=Math.min((t-last)/1000||0,0.04); last=t;
+    update(dt); draw(); requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
