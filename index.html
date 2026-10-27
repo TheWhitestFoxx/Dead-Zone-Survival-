@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <title>Dead Zone: Survival</title>
+  <title>Dead Zone: Survival — v2</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -15,6 +15,16 @@
       position: fixed; inset: 12px 12px auto; display: flex;
       justify-content: space-between; gap: 10px; pointer-events: none;
       text-shadow: 0 2px 4px #000; font-weight: 700;
+    }
+    #hpwrap {
+      position: fixed; left: 12px; top: 42px; width: 190px; height: 12px;
+      background: #0009; border: 1px solid #ffffff44; border-radius: 6px; pointer-events: none;
+    }
+    #hpfill { height: 100%; width: 100%; border-radius: 6px; background: #57d977; transition: width .12s; }
+    #banner {
+      position: fixed; left: 50%; top: 22%; transform: translateX(-50%);
+      font-size: 40px; font-weight: 800; letter-spacing: 2px; color: #ffd36a;
+      text-shadow: 0 3px 10px #000; pointer-events: none; opacity: 0; transition: opacity .25s;
     }
     #hint {
       position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%);
@@ -35,8 +45,10 @@
 </head>
 <body>
   <canvas id="game"></canvas>
-  <div id="hud"><span id="stats"></span><span>DEAD ZONE</span></div>
-  <div id="hint">WASD / arrows to move · Mouse to aim and fire · R to restart</div>
+  <div id="hud"><span id="stats"></span><span>DEAD ZONE v2</span></div>
+  <div id="hpwrap"><div id="hpfill"></div></div>
+  <div id="banner"></div>
+  <div id="hint">WASD / arrows to move · Mouse to aim and fire · Shift/Space = dash · P = pause · M = mute</div>
   <div id="controls">
     <div class="pad">
       <span></span><button data-key="up">▲</button><span></span>
@@ -49,125 +61,312 @@
   const canvas = document.querySelector("#game");
   const ctx = canvas.getContext("2d");
   const stats = document.querySelector("#stats");
-  let w, h, last = 0, spawnTimer = 0, gameOver = false;
-  const keys = new Set(), bullets = [], zombies = [];
-  const player = { x: 0, y: 0, r: 13, hp: 100, score: 0, speed: 220, cooldown: 0, aim: 0 };
-  const pointer = { x: 0, y: 0, down: false };
+  const hpfill = document.querySelector("#hpfill");
+  const bannerEl = document.querySelector("#banner");
+  let w = 0, h = 0, last = 0;
+  let state = "menu"; // menu | playing | over
+  let paused = false, muted = false, tGame = 0, shake = 0;
+  let wave = 0, toSpawn = 0, spawnTimer = 0, spawnInterval = 1, intermission = 0, bannerT = 0;
+  const keys = new Set(), bullets = [], zombies = [], particles = [], drops = [];
+  const player = { x: 0, y: 0, r: 13, hp: 100, score: 0, kills: 0, best: +(localStorage.getItem("dz-best") || 0), speed: 230, cooldown: 0, aim: 0, dashT: 0, dashCd: 0, rapidUntil: 0 };
+  const pointer = { x: 0, y: 0, down: false, touch: false };
   const held = { up:false, down:false, left:false, right:false, fire:false };
+
+  // ---------- tiny synth sounds (no audio files) ----------
+  let AC = null;
+  function ac() { if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {} } if (AC && AC.state === "suspended") AC.resume(); return AC; }
+  function tone(f0, f1, dur, type, vol) {
+    if (muted) return; const a = ac(); if (!a) return;
+    const o = a.createOscillator(), g = a.createGain(), t = a.currentTime;
+    o.type = type; o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur);
+  }
+  const sShoot = () => tone(720, 180, .07, "square", .05);
+  const sHit   = () => tone(300, 120, .05, "sawtooth", .05);
+  const sDie   = () => tone(200, 40, .18, "sawtooth", .09);
+  const sHurt  = () => tone(140, 70, .15, "triangle", .12);
+  const sPick  = () => { tone(660, 660, .07, "sine", .09); setTimeout(() => tone(990, 990, .09, "sine", .09), 70); };
+  const sWave  = () => { tone(392, 392, .12, "square", .08); setTimeout(() => tone(523, 523, .16, "square", .08), 120); };
 
   function resize() {
     const dpr = Math.min(devicePixelRatio || 1, 2);
     w = innerWidth; h = innerHeight;
     canvas.width = w * dpr; canvas.height = h * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (!player.x) { player.x = w / 2; player.y = h / 2; }
+    if (!player.x) { player.x = w / 2; player.y = h / 2; pointer.x = player.x + 60; pointer.y = player.y; }
   }
   addEventListener("resize", resize); resize();
 
-  addEventListener("keydown", e => {
-    keys.add(e.key.toLowerCase());
-    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase())) e.preventDefault();
-    if (e.key.toLowerCase() === "r" && gameOver) restart();
-  });
-  addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
-  canvas.addEventListener("pointermove", e => { pointer.x=e.clientX; pointer.y=e.clientY; });
-  canvas.addEventListener("pointerdown", e => { pointer.down=true; pointer.x=e.clientX; pointer.y=e.clientY; });
-  addEventListener("pointerup", () => pointer.down=false);
-
-  document.querySelectorAll("[data-key]").forEach(b => {
-    const k=b.dataset.key;
-    const set = v => { held[k]=v; };
-    b.addEventListener("pointerdown", e => { e.preventDefault(); set(true); b.setPointerCapture(e.pointerId); });
-    b.addEventListener("pointerup", () => set(false));
-    b.addEventListener("pointercancel", () => set(false));
-  });
-  const fireButton=document.querySelector("#fire");
-  fireButton.addEventListener("pointerdown", e => { e.preventDefault(); held.fire=true; fireButton.setPointerCapture(e.pointerId); });
-  fireButton.addEventListener("pointerup", () => held.fire=false);
-  fireButton.addEventListener("pointercancel", () => held.fire=false);
-
-  function shoot(angle) {
-    const speed=560;
-    bullets.push({x:player.x+Math.cos(angle)*18,y:player.y+Math.sin(angle)*18,
-      vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,life:1.1});
-  }
-  function spawnZombie() {
-    const side=Math.floor(Math.random()*4);
-    const x=side===0?0:side===1?w:Math.random()*w;
-    const y=side===2?0:side===3?h:Math.random()*h;
-    zombies.push({x,y,r:14,hp:2,speed:35+Math.random()*22});
+  function showBanner(txt, secs) { bannerEl.textContent = txt; bannerEl.style.opacity = 1; bannerT = secs; }
+  function startWave(n) {
+    wave = n; toSpawn = 6 + n * 3; spawnTimer = .5;
+    spawnInterval = Math.max(.3, 1.15 - n * .07);
+    showBanner("WAVE " + n, 1.8); sWave();
   }
   function restart() {
-    player.x=w/2; player.y=h/2; player.hp=100; player.score=0;
-    bullets.length=0; zombies.length=0; gameOver=false; spawnTimer=0;
+    player.x = w/2; player.y = h/2; player.hp = 100; player.score = 0; player.kills = 0;
+    player.cooldown = 0; player.dashT = 0; player.dashCd = 0; player.rapidUntil = 0;
+    bullets.length = 0; zombies.length = 0; particles.length = 0; drops.length = 0;
+    paused = false; tGame = 0; shake = 0; state = "playing";
+    startWave(1);
   }
+  function gameOver() {
+    state = "over"; sDie();
+    if (player.score > player.best) { player.best = player.score; localStorage.setItem("dz-best", player.best); }
+  }
+
+  addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    keys.add(k);
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+    if (k === "m") muted = !muted;
+    if (k === "p" || k === "escape") { if (state === "playing") paused = !paused; }
+    if ((k === " " || k === "shift") && state === "playing" && !paused && player.dashCd <= 0) player.dashT = .16;
+    if (k === "enter" && state !== "playing") restart();
+    if (k === "r" && state === "over") restart();
+  });
+  addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+  canvas.addEventListener("pointermove", e => { pointer.x = e.clientX; pointer.y = e.clientY; pointer.touch = e.pointerType === "touch"; });
+  canvas.addEventListener("pointerdown", e => {
+    ac();
+    if (state !== "playing") { restart(); return; }
+    pointer.down = true; pointer.x = e.clientX; pointer.y = e.clientY; pointer.touch = e.pointerType === "touch";
+  });
+  addEventListener("pointerup", () => pointer.down = false);
+
+  document.querySelectorAll("[data-key]").forEach(b => {
+    const k = b.dataset.key;
+    b.addEventListener("pointerdown", e => { e.preventDefault(); if (state !== "playing") { restart(); return; } held[k] = true; b.setPointerCapture(e.pointerId); });
+    b.addEventListener("pointerup", () => held[k] = false);
+    b.addEventListener("pointercancel", () => held[k] = false);
+  });
+  const fireButton = document.querySelector("#fire");
+  fireButton.addEventListener("pointerdown", e => { e.preventDefault(); ac(); if (state !== "playing") { restart(); return; } held.fire = true; pointer.touch = true; fireButton.setPointerCapture(e.pointerId); });
+  fireButton.addEventListener("pointerup", () => held.fire = false);
+  fireButton.addEventListener("pointercancel", () => held.fire = false);
+
+  function shoot(angle) {
+    const speed = 580;
+    bullets.push({ x: player.x + Math.cos(angle)*18, y: player.y + Math.sin(angle)*18,
+      vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, life: 1.1 });
+    burst(player.x + Math.cos(angle)*24, player.y + Math.sin(angle)*24, 2, "#ffd36a", 60, .12);
+    sShoot();
+  }
+  function burst(x, y, n, color, spd, life) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random()*Math.PI*2, s = (0.3 + Math.random()*0.7) * spd;
+      particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s, life: life*(0.6+Math.random()*0.7), max: life, color, size: 2 + Math.random()*2.5 });
+    }
+  }
+  function spawnZombie() {
+    const side = Math.floor(Math.random()*4);
+    const x = side === 0 ? -20 : side === 1 ? w + 20 : Math.random()*w;
+    const y = side === 2 ? -20 : side === 3 ? h + 20 : Math.random()*h;
+    const roll = Math.random();
+    let type = "walker";
+    if (wave >= 4 && roll < .12) type = "brute";
+    else if (wave >= 2 && roll < .42) type = "runner";
+    if (type === "brute")  zombies.push({ x, y, type, r: 26, hp: 8 + wave, maxhp: 8 + wave, speed: 22 + Math.random()*8, dmg: 40, pts: 50 });
+    else if (type === "runner") zombies.push({ x, y, type, r: 10, hp: 1, maxhp: 1, speed: 88 + Math.random()*24 + wave, dmg: 18, pts: 15 });
+    else zombies.push({ x, y, type, r: 14, hp: 2 + Math.floor(wave/5), maxhp: 2 + Math.floor(wave/5), speed: 35 + Math.random()*22 + Math.min(wave*1.5, 25), dmg: 24, pts: 10 });
+  }
+  function maybeDrop(x, y) {
+    const roll = Math.random();
+    if (roll < .10) drops.push({ x, y, kind: "hp", t: 10 });
+    else if (roll < .17) drops.push({ x, y, kind: "rapid", t: 10 });
+  }
+
   function update(dt) {
-    if (gameOver) return;
-    let dx=0,dy=0;
-    if (keys.has("w")||keys.has("arrowup")||held.up) dy--;
-    if (keys.has("s")||keys.has("arrowdown")||held.down) dy++;
-    if (keys.has("a")||keys.has("arrowleft")||held.left) dx--;
-    if (keys.has("d")||keys.has("arrowright")||held.right) dx++;
-    const mag=Math.hypot(dx,dy)||1;
-    player.x=Math.max(player.r,Math.min(w-player.r,player.x+dx/mag*player.speed*dt));
-    player.y=Math.max(player.r,Math.min(h-player.r,player.y+dy/mag*player.speed*dt));
+    if (bannerT > 0) { bannerT -= dt; if (bannerT <= 0) bannerEl.style.opacity = 0; }
+    // particles + drops always tick for menu/over backgrounds
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i]; p.x += p.vx*dt; p.y += p.vy*dt; p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+    if (state !== "playing" || paused) return;
+    tGame += dt;
+    if (shake > 0) shake = Math.max(0, shake - dt * 26);
 
-    if (pointer.x || pointer.y) player.aim=Math.atan2(pointer.y-player.y,pointer.x-player.x);
-    player.cooldown-=dt;
-    if ((pointer.down||held.fire) && player.cooldown<=0) {
-      shoot(player.aim); player.cooldown=.2;
+    let dx = 0, dy = 0;
+    if (keys.has("w") || keys.has("arrowup") || held.up) dy--;
+    if (keys.has("s") || keys.has("arrowdown") || held.down) dy++;
+    if (keys.has("a") || keys.has("arrowleft") || held.left) dx--;
+    if (keys.has("d") || keys.has("arrowright") || held.right) dx++;
+    const mag = Math.hypot(dx, dy) || 1;
+    player.dashCd -= dt;
+    let speedNow = player.speed;
+    if (player.dashT > 0) {
+      player.dashT -= dt; speedNow = player.speed * 2.6;
+      if (player.dashT <= 0) player.dashCd = 1.1;
+      burst(player.x, player.y, 1, "#56b4a0", 30, .25);
+    }
+    if (dx || dy) {
+      player.x = Math.max(player.r, Math.min(w - player.r, player.x + dx/mag * speedNow * dt));
+      player.y = Math.max(player.r, Math.min(h - player.r, player.y + dy/mag * speedNow * dt));
     }
 
-    spawnTimer-=dt;
-    if (spawnTimer<=0) { spawnZombie(); spawnTimer=Math.max(.35,1.25-player.score*.008); }
-
-    for (let i=bullets.length-1;i>=0;i--) {
-      const b=bullets[i]; b.x+=b.vx*dt; b.y+=b.vy*dt; b.life-=dt;
-      if (b.life<=0 || b.x<0 || b.x>w || b.y<0 || b.y>h) bullets.splice(i,1);
+    // aim: touch players get assist toward the nearest zombie
+    const touchAim = pointer.touch || held.fire || held.up || held.down || held.left || held.right;
+    if (touchAim && zombies.length) {
+      let bz = null, bd = 1e12;
+      for (const z of zombies) { const d = (z.x-player.x)**2 + (z.y-player.y)**2; if (d < bd) { bd = d; bz = z; } }
+      if (bz) player.aim = Math.atan2(bz.y - player.y, bz.x - player.x);
+    } else if (pointer.x || pointer.y) {
+      player.aim = Math.atan2(pointer.y - player.y, pointer.x - player.x);
     }
-    for (let i=zombies.length-1;i>=0;i--) {
-      const z=zombies[i], a=Math.atan2(player.y-z.y,player.x-z.x);
-      z.x+=Math.cos(a)*z.speed*dt; z.y+=Math.sin(a)*z.speed*dt;
-      if (Math.hypot(player.x-z.x,player.y-z.y)<player.r+z.r) {
-        player.hp-=24*dt;
-        if (player.hp<=0) { player.hp=0; gameOver=true; }
+
+    player.cooldown -= dt;
+    const rapid = tGame < player.rapidUntil;
+    if ((pointer.down || held.fire) && player.cooldown <= 0) {
+      shoot(player.aim); player.cooldown = rapid ? .09 : .2;
+    }
+
+    // waves
+    if (intermission > 0) {
+      intermission -= dt;
+      if (intermission <= 0) startWave(wave + 1);
+    } else {
+      if (toSpawn > 0) {
+        spawnTimer -= dt;
+        if (spawnTimer <= 0) { spawnZombie(); toSpawn--; spawnTimer = spawnInterval * (0.6 + Math.random() * 0.7); }
+      } else if (zombies.length === 0) {
+        const bonus = 25 * wave; player.score += bonus;
+        showBanner("WAVE " + wave + " CLEAR  +" + bonus, 1.8); sPick();
+        intermission = 3;
       }
-      for (let j=bullets.length-1;j>=0;j--) {
-        const b=bullets[j];
-        if (Math.hypot(b.x-z.x,b.y-z.y)<z.r+4) {
-          z.hp--; bullets.splice(j,1);
-          if (z.hp<=0) { zombies.splice(i,1); player.score++; }
+    }
+
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i]; b.x += b.vx*dt; b.y += b.vy*dt; b.life -= dt;
+      if (b.life <= 0 || b.x < -30 || b.x > w + 30 || b.y < -30 || b.y > h + 30) bullets.splice(i, 1);
+    }
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i]; d.t -= dt;
+      if (d.t <= 0) { drops.splice(i, 1); continue; }
+      if (Math.hypot(player.x - d.x, player.y - d.y) < player.r + 15) {
+        if (d.kind === "hp") player.hp = Math.min(100, player.hp + 30);
+        else player.rapidUntil = tGame + 8;
+        burst(d.x, d.y, 10, d.kind === "hp" ? "#57d977" : "#ffd36a", 80, .35);
+        sPick(); drops.splice(i, 1);
+      }
+    }
+
+    let hurtNow = false;
+    for (let i = zombies.length - 1; i >= 0; i--) {
+      const z = zombies[i], a = Math.atan2(player.y - z.y, player.x - z.x);
+      z.x += Math.cos(a) * z.speed * dt; z.y += Math.sin(a) * z.speed * dt;
+      if (Math.hypot(player.x - z.x, player.y - z.y) < player.r + z.r) {
+        player.hp -= z.dmg * dt; hurtNow = true;
+        if (player.hp <= 0) { player.hp = 0; burst(player.x, player.y, 30, "#e5534b", 160, .6); gameOver(); return; }
+      }
+      for (let j = bullets.length - 1; j >= 0; j--) {
+        const b = bullets[j];
+        if (Math.hypot(b.x - z.x, b.y - z.y) < z.r + 4) {
+          z.hp--; bullets.splice(j, 1); sHit();
+          burst(b.x, b.y, 3, "#9fd48a", 70, .2);
+          if (z.hp <= 0) {
+            burst(z.x, z.y, z.type === "brute" ? 26 : 12, z.type === "runner" ? "#e5a34b" : "#668c57", 120, .45);
+            maybeDrop(z.x, z.y);
+            zombies.splice(i, 1); player.score += z.pts; player.kills++; sDie();
+          }
           break;
         }
       }
     }
+    if (hurtNow) { shake = Math.min(6, shake + dt * 30); if (Math.random() < dt * 6) sHurt(); }
+  }
+
+  function drawZombie(z) {
+    const body = z.type === "brute" ? "#7a4b8f" : z.type === "runner" ? "#c27a35" : "#668c57";
+    ctx.fillStyle = body; ctx.beginPath(); ctx.arc(z.x, z.y, z.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#1b241b";
+    const s = z.r / 14;
+    ctx.fillRect(z.x - 7*s, z.y - 3*s, 4*s, 4*s); ctx.fillRect(z.x + 3*s, z.y - 3*s, 4*s, 4*s);
+    if (z.hp < z.maxhp) {
+      ctx.fillStyle = "#000a"; ctx.fillRect(z.x - z.r, z.y - z.r - 9, z.r * 2, 4);
+      ctx.fillStyle = "#e5534b"; ctx.fillRect(z.x - z.r, z.y - z.r - 9, z.r * 2 * (z.hp / z.maxhp), 4);
+    }
   }
   function draw() {
-    ctx.fillStyle="#18211d"; ctx.fillRect(0,0,w,h);
-    ctx.strokeStyle="#26332d"; ctx.lineWidth=1;
-    for(let x=0;x<w;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
-    for(let y=0;y<h;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+    const grad = ctx.createRadialGradient(w/2, h/2, 80, w/2, h/2, Math.max(w, h) * .75);
+    grad.addColorStop(0, "#1d2a22"); grad.addColorStop(1, "#121a15");
+    ctx.fillStyle = grad; ctx.fillRect(-10, -10, w + 20, h + 20);
+    ctx.strokeStyle = "#26332d"; ctx.lineWidth = 1;
+    for (let x = 0; x < w; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+    for (let y = 0; y < h; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
 
-    bullets.forEach(b=>{ctx.fillStyle="#ffd36a";ctx.beginPath();ctx.arc(b.x,b.y,4,0,Math.PI*2);ctx.fill();});
-    zombies.forEach(z=>{
-      ctx.fillStyle="#668c57";ctx.beginPath();ctx.arc(z.x,z.y,z.r,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle="#1b241b";ctx.fillRect(z.x-7,z.y-3,4,4);ctx.fillRect(z.x+3,z.y-3,4,4);
+    drops.forEach(d => {
+      const blink = d.t < 3 && Math.floor(d.t * 6) % 2 === 0;
+      if (blink) return;
+      ctx.fillStyle = d.kind === "hp" ? "#1f5130" : "#5c4712";
+      ctx.beginPath(); ctx.arc(d.x, d.y, 11, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = d.kind === "hp" ? "#57d977" : "#ffd36a";
+      ctx.font = "bold 14px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(d.kind === "hp" ? "+" : "»", d.x, d.y + 1);
     });
-    ctx.save(); ctx.translate(player.x,player.y); ctx.rotate(player.aim);
-    ctx.fillStyle="#d5ded8";ctx.fillRect(0,-5,22,10);
-    ctx.fillStyle="#56b4a0";ctx.beginPath();ctx.arc(0,0,player.r,0,Math.PI*2);ctx.fill();
+    bullets.forEach(b => { ctx.fillStyle = "#ffd36a"; ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI * 2); ctx.fill(); });
+    zombies.forEach(drawZombie);
+    particles.forEach(p => {
+      ctx.globalAlpha = Math.max(p.life / p.max, 0);
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+
+    if (state !== "menu") {
+      ctx.save(); ctx.translate(player.x, player.y); ctx.rotate(player.aim);
+      ctx.fillStyle = "#d5ded8"; ctx.fillRect(0, -5, 22, 10);
+      ctx.fillStyle = "#56b4a0"; ctx.beginPath(); ctx.arc(0, 0, player.r, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#0e2a24"; ctx.beginPath(); ctx.arc(3, -4, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+      if (player.dashCd > 0 && player.dashT <= 0) {
+        ctx.fillStyle = "#ffffff33"; ctx.fillRect(player.x - 14, player.y + 20, 28 * Math.max(0, 1 - player.dashCd / 1.1), 3);
+      }
+    }
     ctx.restore();
 
-    stats.textContent=`Health: ${Math.ceil(player.hp)}  |  Eliminations: ${player.score}`;
-    if(gameOver){
-      ctx.fillStyle="#000a";ctx.fillRect(0,0,w,h);
-      ctx.textAlign="center";ctx.fillStyle="white";
-      ctx.font="bold 42px system-ui";ctx.fillText("GAME OVER",w/2,h/2-15);
-      ctx.font="18px system-ui";ctx.fillText(`Eliminations: ${player.score} · Press R to restart`,w/2,h/2+25);
+    const left = toSpawn + zombies.length;
+    stats.textContent = state === "menu" ? "" :
+      "Wave: " + wave + "  |  Score: " + player.score + "  |  Best: " + Math.max(player.best, player.score) +
+      "  |  Left: " + left + (tGame < player.rapidUntil ? "  |  RAPID FIRE" : "") + (muted ? "  |  MUTED" : "");
+    hpfill.style.width = Math.max(player.hp, 0) + "%";
+    hpfill.style.background = player.hp > 50 ? "#57d977" : player.hp > 25 ? "#ffd36a" : "#e5534b";
+
+    ctx.textAlign = "center";
+    if (state === "menu") {
+      ctx.fillStyle = "#000a"; ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = "#ffd36a"; ctx.font = "bold 52px system-ui";
+      ctx.fillText("DEAD ZONE", w/2, h/2 - 70);
+      ctx.fillStyle = "white"; ctx.font = "bold 26px system-ui";
+      ctx.fillText("SURVIVAL v2", w/2, h/2 - 32);
+      ctx.font = "17px system-ui"; ctx.fillStyle = "#d5ddd8";
+      ctx.fillText("Survive the waves. Watch for runners and brutes.", w/2, h/2 + 12);
+      ctx.fillText("Grab + for health and » for rapid fire.", w/2, h/2 + 38);
+      ctx.fillText("Click, tap, or press Enter to start", w/2, h/2 + 78);
+      if (player.best) { ctx.fillStyle = "#ffd36a"; ctx.fillText("Best score: " + player.best, w/2, h/2 + 112); }
+    }
+    if (paused && state === "playing") {
+      ctx.fillStyle = "#000a"; ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = "white"; ctx.font = "bold 40px system-ui";
+      ctx.fillText("PAUSED", w/2, h/2);
+      ctx.font = "17px system-ui"; ctx.fillText("Press P to keep going", w/2, h/2 + 34);
+    }
+    if (state === "over") {
+      ctx.fillStyle = "#000a"; ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = "#e5534b"; ctx.font = "bold 46px system-ui";
+      ctx.fillText("GAME OVER", w/2, h/2 - 40);
+      ctx.fillStyle = "white"; ctx.font = "19px system-ui";
+      ctx.fillText("You survived to Wave " + wave + "  ·  Score: " + player.score + "  ·  Eliminations: " + player.kills, w/2, h/2 + 6);
+      ctx.fillText("Best score: " + player.best, w/2, h/2 + 34);
+      ctx.fillStyle = "#ffd36a";
+      ctx.fillText("Press R, click, or tap to play again", w/2, h/2 + 72);
     }
   }
   function frame(t) {
-    const dt=Math.min((t-last)/1000||0,0.04); last=t;
+    const dt = Math.min((t - last) / 1000 || 0, 0.04); last = t;
     update(dt); draw(); requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
